@@ -65,18 +65,6 @@ namespace azure_cosmosdb_rbac_access
             Container container;
             switch (RBACTestMode)
             {
-                default:
-                case "RBAC_AADauth":
-                    //RBAC-based authentication #1 - AAD App
-                    ClientSecretCredential servicePrincipal = new ClientSecretCredential(
-                        aad_tenant_id,
-                        aad_application_id,
-                        aad_application_secret);
-                    RBACclientAAD = new CosmosClient(cosmosdb_uri, servicePrincipal, clientOptions);
-                    database = RBACclientAAD.GetDatabase(cosmosdb_dbname);
-                    container = RBACclientAAD.GetContainer(cosmosdb_dbname, cosmosdb_containername);
-                    break;
-
                 case "RBAC_MIauth":
                     //RBAC-based authentication #2 - Managed Identity
                     var tokenCredential = new DefaultAzureCredential();
@@ -92,6 +80,18 @@ namespace azure_cosmosdb_rbac_access
                     keyClient = new CosmosClient(cosmosdb_uri, cosmosdb_accountkey, clientOptions);
                     database = await keyClient.CreateDatabaseIfNotExistsAsync(cosmosdb_dbname);
                     container = keyClient.GetContainer(cosmosdb_dbname, cosmosdb_containername);
+                    break;
+
+                default:
+                case "RBAC_AADauth":
+                    //RBAC-based authentication #1 - AAD App
+                    ClientSecretCredential servicePrincipal = new ClientSecretCredential(
+                        aad_tenant_id,
+                        aad_application_id,
+                        aad_application_secret);
+                    RBACclientAAD = new CosmosClient(cosmosdb_uri, servicePrincipal, clientOptions);
+                    database = RBACclientAAD.GetDatabase(cosmosdb_dbname);
+                    container = RBACclientAAD.GetContainer(cosmosdb_dbname, cosmosdb_containername);
                     break;
             }
 
