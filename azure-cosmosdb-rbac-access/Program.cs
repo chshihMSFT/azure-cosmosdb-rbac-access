@@ -8,6 +8,7 @@ using Microsoft.Azure.Cosmos;
 using Microsoft.Azure.Cosmos.Linq;
 using Microsoft.Extensions.Configuration;
 using System.Diagnostics;
+using Microsoft.Extensions.Logging;
 
 /*
 Prerequisites:
@@ -43,6 +44,7 @@ namespace azure_cosmosdb_rbac_access
 {
     class Program
     {
+        static String application_env;
         static String application_name;
         static String aad_tenant_id;
         static String aad_managed_user_id;
@@ -58,11 +60,20 @@ namespace azure_cosmosdb_rbac_access
 
         static async Task Main(string[] args)
         {
-            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, Azure Cosmos DB - RBAC access demo ... start");
+            var loggerFactory = LoggerFactory.Create(builder =>
+            {
+                builder.AddConsole();
+                builder.AddAzureWebAppDiagnostics();
+            });
+
+            ILogger logger = loggerFactory.CreateLogger<Program>();
+
+            logger.LogInformation($"{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.ffffff}, Azure Cosmos DB - RBAC access demo ... start");
 
             IConfigurationRoot configuration = new ConfigurationBuilder()
                         .AddJsonFile("appSettings.json")
                         .Build();
+            application_env = configuration["application_env"].ToString();
             application_name = configuration["application_name"].ToString();
             aad_tenant_id = configuration["aad_tenant_id"].ToString();
             aad_managed_user_id = configuration["aad_managed_user_id"].ToString();
@@ -86,14 +97,15 @@ namespace azure_cosmosdb_rbac_access
                 , CosmosClientTelemetryOptions = new CosmosClientTelemetryOptions { DisableSendingMetricsToService = false }
             };
 
-            CosmosClient keyClient;            
-            CosmosClient RBACclientAAD;
-            CosmosClient RBACclientMI;
-            Database database;
-            Container container;
+            CosmosClient keyClient = null;            
+            CosmosClient RBACclientAAD = null;
+            CosmosClient RBACclientMI = null;
+            Database database = null;
+            Container container = null;
             switch (RBACTestMode)
             {
                 case "KeyAuth":
+                    //Key-based authentication
                     keyClient = new CosmosClient(cosmosdb_uri, cosmosdb_accountkey, clientOptions);
 
                     database = keyClient.GetDatabase(cosmosdb_dbname);
@@ -103,9 +115,10 @@ namespace azure_cosmosdb_rbac_access
                 case "RBAC_AADauth":
                     //RBAC-based authentication #1 - AAD App
                     ClientSecretCredential servicePrincipal = new ClientSecretCredential(
-                        aad_tenant_id,
-                        aad_application_id,
-                        aad_application_secret);
+                    aad_tenant_id,
+                    aad_application_id,
+                    aad_application_secret);
+                    
                     RBACclientAAD = new CosmosClient(cosmosdb_uri, servicePrincipal, clientOptions);
                     database = RBACclientAAD.GetDatabase(cosmosdb_dbname);
                     container = RBACclientAAD.GetContainer(cosmosdb_dbname, cosmosdb_containername);
@@ -114,16 +127,66 @@ namespace azure_cosmosdb_rbac_access
                 default:
                 case "RBAC_MIauth":
                     //RBAC-based authentication #2 - Managed Identity
-                    var tokenCredential = new DefaultAzureCredential(
-                        new DefaultAzureCredentialOptions
-                        {
-                            TenantId = aad_tenant_id
-                        });
+                    if (application_env.ToLower() == "local")
+                    {
+                        //Locally, use DefaultAzureCredential
+                        var tokenCredential = new DefaultAzureCredential(
+                            new DefaultAzureCredentialOptions
+                            {
+                                TenantId = aad_tenant_id
+                            });
+                        RBACclientMI = new CosmosClient(cosmosdb_uri, tokenCredential, clientOptions);
+                    }
+                    else if (application_env.ToLower() == "cloud")
+                    {
+                        //Azure side, use ManagedIdentityCredential
+                        var tokenCredential = new ManagedIdentityCredential(
+                            clientId: aad_managed_user_id,
+                            new DefaultAzureCredentialOptions
+                            {
+                                TenantId = aad_tenant_id
+                            });
+                        RBACclientMI = new CosmosClient(cosmosdb_uri, tokenCredential, clientOptions);
+                    }                    
+                    //----------------------------------------
+                    //debuging only
+                    //var cloudTokenRequestContext = new TokenRequestContext(new[] { "https://management.azure.com/.default" });
+                    //var cloudToken = await cloudTokenCredential.GetTokenAsync(cloudTokenRequestContext);
+                    //logger.LogInformation($"cloud Access Token: {cloudToken.Token}");
+                    //----------------------------------------
 
-                    RBACclientMI = new CosmosClient(cosmosdb_uri, tokenCredential, clientOptions);
                     database = RBACclientMI.GetDatabase(cosmosdb_dbname);
                     container = RBACclientMI.GetContainer(cosmosdb_dbname, cosmosdb_containername);
                     break;
+            }
+
+            ContainerResponse containerInfo = null;
+            try
+            {
+                containerInfo = await container.ReadContainerAsync();
+            }
+            catch (CosmosException ex)
+            {
+                logger.LogError($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, readContainer failed: {ex.Message}" +
+                            $"Diagnostics: {ex}");
+            }
+            finally
+            {
+                logger.LogInformation($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, readContainer success" +
+                    $"\n==========" +
+                    $"\nApplication Env: {application_env}" +
+                    $"\nApplication Name: {application_name}" +
+                    $"\nEntraID Tenant Id: {aad_tenant_id}" +
+                    $"\nEntraID ObjectId: {aad_managed_user_id}" +
+                    $"\nRBACTestMode: {RBACTestMode}" +
+                    $"\nData Model: {cosmosdb_datamodel}" +
+                    $"\nEndpoint: {cosmosdb_uri}" +
+                    $"\nDatabase Name: {cosmosdb_dbname}" +
+                    $"\nContainer Name: {cosmosdb_containername}" +
+                    $"\nContainer SelfLink: {containerInfo.Resource.SelfLink}" +
+                    $"\nrequest_interval: {request_interval}" +
+                    $"\n=========="
+                    );
             }
 
             String fmt = "0000.00";
@@ -135,7 +198,7 @@ namespace azure_cosmosdb_rbac_access
                     Stopwatch stopwatch = new Stopwatch();
                     Item demodoc = new Item();
                     int i = 1;
-                    while (true) 
+                    while (true)
                     {
                         demodoc.id = Guid.NewGuid().ToString();
                         demodoc.pk = RBACTestMode;
@@ -151,14 +214,14 @@ namespace azure_cosmosdb_rbac_access
                         }
                         catch (CosmosException ex)
                         {
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, CreateItem,\t\tFailed: {ex.Message}" +
+                            logger.LogError($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, CreateItem,\t\tFailed: {ex.Message}" +
                             $"Diagnostics: {ex}");
                         }
                         finally
                         {
                             stopwatch.Stop();
                             Item pointCreateResult = responseCreate.Resource;
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, CreateItem,\t\tConsumed:{responseCreate.RequestCharge.ToString(fmt)} RUs in {stopwatch.Elapsed.TotalMilliseconds.ToString(fmt)} ms,\t" +
+                            logger.LogInformation($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, CreateItem,\t\tConsumed:{responseCreate.RequestCharge.ToString(fmt)} RUs in {stopwatch.Elapsed.TotalMilliseconds.ToString(fmt)} ms,\t" +
                                 $"ActivityId:{responseCreate.ActivityId}, " +
                                 $"{{id: {pointCreateResult.id}, pk: {pointCreateResult.pk}, counter: {pointCreateResult.counter}, _ts: {pointCreateResult._ts}, _etag: {pointCreateResult._etag}}}");
                         }
@@ -174,14 +237,14 @@ namespace azure_cosmosdb_rbac_access
                         }
                         catch (CosmosException ex)
                         {
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, UpsertItem,\t\tFailed: {ex.Message}" +
+                            logger.LogError($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, UpsertItem,\t\tFailed: {ex.Message}" +
                             $"Diagnostics: {ex}");
                         }
                         finally
                         {
                             stopwatch.Stop();
                             Item pointUpsertResult = responseUpsert.Resource;
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, UpsertItem,\t\tConsumed:{responseUpsert.RequestCharge.ToString(fmt)} RUs in {stopwatch.Elapsed.TotalMilliseconds.ToString(fmt)} ms,\t" +
+                            logger.LogInformation($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, UpsertItem,\t\tConsumed:{responseUpsert.RequestCharge.ToString(fmt)} RUs in {stopwatch.Elapsed.TotalMilliseconds.ToString(fmt)} ms,\t" +
                                 $"ActivityId:{responseUpsert.ActivityId}, " +
                                 $"{{id: {pointUpsertResult.id}, pk: {pointUpsertResult.pk}, counter: {pointUpsertResult.counter}, _ts: {pointUpsertResult._ts}, _etag: {pointUpsertResult._etag}}}");
                         }
@@ -196,14 +259,14 @@ namespace azure_cosmosdb_rbac_access
                         }
                         catch (CosmosException ex)
                         {
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, ReadItem,\t\tFailed: {ex.Message}" +
+                            logger.LogError($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, ReadItem,\t\tFailed: {ex.Message}" +
                             $"Diagnostics: {ex}");
                         }
                         finally
                         {
                             stopwatch.Stop();
                             Item pointReadResult = responseRead.Resource;
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, ReadItem,\t\tConsumed:{responseRead.RequestCharge.ToString(fmt)} RUs in {stopwatch.Elapsed.TotalMilliseconds.ToString(fmt)} ms,\t" +
+                            logger.LogInformation($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, ReadItem,\t\tConsumed:{responseRead.RequestCharge.ToString(fmt)} RUs in {stopwatch.Elapsed.TotalMilliseconds.ToString(fmt)} ms,\t" +
                                 $"ActivityId:{responseRead.ActivityId}, " +
                                 $"{{id: {pointReadResult.id}, pk: {pointReadResult.pk}, counter: {pointReadResult.counter}, _ts: {pointReadResult._ts}, _etag: {pointReadResult._etag}}}");
                         }
@@ -226,17 +289,17 @@ namespace azure_cosmosdb_rbac_access
                         }
                         catch (CosmosException ex)
                         {
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, ReadManyItem,\tFailed: {ex.Message}" +
+                            logger.LogError($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, ReadManyItem,\tFailed: {ex.Message}" +
                             $"Diagnostics: {ex}");
                         }
                         finally
                         {
                             stopwatch.Stop();
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, ReadManyItem,\tConsumed:{responseReadMany.RequestCharge.ToString(fmt)} RUs in {stopwatch.Elapsed.TotalMilliseconds.ToString(fmt)} ms,\t" +
+                            logger.LogInformation($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, ReadManyItem,\tConsumed:{responseReadMany.RequestCharge.ToString(fmt)} RUs in {stopwatch.Elapsed.TotalMilliseconds.ToString(fmt)} ms,\t" +
                                 $"ActivityId:{responseReadMany.ActivityId}.");
                             foreach (Item pointReadManyResult in responseReadMany)
                             {
-                                Console.WriteLine($"{{id: {pointReadManyResult.id}, pk: {pointReadManyResult.pk}, counter: {pointReadManyResult.counter}, _ts: {pointReadManyResult._ts}, _etag: {pointReadManyResult._etag}}}");
+                                logger.LogInformation($"{{id: {pointReadManyResult.id}, pk: {pointReadManyResult.pk}, counter: {pointReadManyResult.counter}, _ts: {pointReadManyResult._ts}, _etag: {pointReadManyResult._etag}}}");
                             }
                         }
                         Thread.Sleep(request_interval);
@@ -263,7 +326,7 @@ namespace azure_cosmosdb_rbac_access
                                     var queryReadResult = await itemIterator.ReadNextAsync();
                                     foreach (Item doc in queryReadResult)
                                     {
-                                        Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, QueryItemLINQ,\tConsumed:{queryReadResult.RequestCharge.ToString(fmt)} RUs in {stopwatch.Elapsed.TotalMilliseconds.ToString(fmt)} ms,\t" +
+                                        logger.LogInformation($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, QueryItemLINQ,\tConsumed:{queryReadResult.RequestCharge.ToString(fmt)} RUs in {stopwatch.Elapsed.TotalMilliseconds.ToString(fmt)} ms,\t" +
                                             $"ActivityId:{responseRead.ActivityId}, " +
                                             $"{{id: {doc.id}, pk: {doc.pk}, counter: {doc.counter}, _ts: {doc._ts}, _etag: {doc._etag}}}");
                                     }
@@ -273,7 +336,7 @@ namespace azure_cosmosdb_rbac_access
                         }
                         catch (CosmosException ex)
                         {
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, QueryItemLINQ,\tFailed: {ex.Message}" +
+                            logger.LogError($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, QueryItemLINQ,\tFailed: {ex.Message}" +
                             $"Diagnostics: {ex}");
                         }
                         Thread.Sleep(request_interval);
@@ -294,19 +357,19 @@ namespace azure_cosmosdb_rbac_access
                                 }
                             ))
                             {
-                                Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, QueryItemTEXT,\t\"{query.QueryText}\"");
+                                logger.LogInformation($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, QueryItemTEXT,\t\"{query.QueryText}\"");
                                 while (queryResultSet.HasMoreResults)
                                 {
                                     foreach (Item doc in await queryResultSet.ReadNextAsync())
                                     {   
-                                        Console.WriteLine($"{{id: {doc.id}, pk: {doc.pk}, counter: {doc.counter}, _ts: {doc._ts}, _etag: {doc._etag}}}");
+                                        logger.LogInformation($"{{id: {doc.id}, pk: {doc.pk}, counter: {doc.counter}, _ts: {doc._ts}, _etag: {doc._etag}}}");
                                     }
                                 }
                             }
                         }
                         catch (CosmosException ex)
                         {
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, QueryItemTEXT,\tFailed: {ex.Message}" +
+                            logger.LogError($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, QueryItemTEXT,\tFailed: {ex.Message}" +
                             $"Diagnostics: {ex}");
                         }
                         Thread.Sleep(request_interval);
@@ -320,14 +383,14 @@ namespace azure_cosmosdb_rbac_access
                         }
                         catch (CosmosException ex)
                         {
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, DeleteItem,\t\tFailed: {ex.Message}" +
+                            logger.LogError($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, DeleteItem,\t\tFailed: {ex.Message}" +
                             $"Diagnostics: {ex}");
                         }
                         finally
                         {
                             stopwatch.Stop();
                             Item pointReadResult = responseRead.Resource;
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, DeleteItem,\t\tConsumed:{responseDelete.RequestCharge.ToString(fmt)} RUs in {stopwatch.Elapsed.TotalMilliseconds.ToString(fmt)} ms,\t" +
+                            logger.LogInformation($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, DeleteItem,\t\tConsumed:{responseDelete.RequestCharge.ToString(fmt)} RUs in {stopwatch.Elapsed.TotalMilliseconds.ToString(fmt)} ms,\t" +
                                 $"ActivityId:{responseDelete.ActivityId}, " +
                                 $"{{id: {demodoc.id}, pk: {demodoc.pk}");
                         }
@@ -338,7 +401,7 @@ namespace azure_cosmosdb_rbac_access
                 }
                 catch (CosmosException ce)
                 {
-                    Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, RBAC Item testing ... Error: {ce.Message}");
+                    logger.LogError($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, RBAC Item testing ... Error: {ce.Message}");
                 }
             }
 
@@ -372,7 +435,7 @@ namespace azure_cosmosdb_rbac_access
                         //1.1 Create Vertex
                         ItemResponse<GraphVertex> responseVCreate = await container.CreateItemAsync<GraphVertex>(demoVertex, new PartitionKey(demoVertex.pk));
                         GraphVertex pointCreateVResult = responseVCreate.Resource;
-                        Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, CreateVertex, Consumed:{responseVCreate.RequestCharge.ToString(fmt)} RUs, ActivityId:{responseVCreate.ActivityId}" +
+                        logger.LogInformation($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {i.ToString("D8")}, CreateVertex, Consumed:{responseVCreate.RequestCharge.ToString(fmt)} RUs, ActivityId:{responseVCreate.ActivityId}" +
                             $", {{id: {pointCreateVResult.id}, pk: {pointCreateVResult.pk}, counter: {pointCreateVResult.counter}, _ts: {pointCreateVResult._ts}, _etag: {pointCreateVResult._etag}}}");
 
                         ////1.2 Create Vertex-Edge
@@ -390,10 +453,10 @@ namespace azure_cosmosdb_rbac_access
 
                             ItemResponse<GraphEdge> responseECreate = await container.CreateItemAsync<GraphEdge>(demoEdge, new PartitionKey(demoEdge.pk));
                             GraphEdge pointCreateEResult = responseECreate.Resource;
-                            Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {j.ToString("D8")}, CreateEdges, Consumed:{responseECreate.RequestCharge.ToString(fmt)} RUs, ActivityId:{responseECreate.ActivityId}" +
+                            logger.LogInformation($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, round {j.ToString("D8")}, CreateEdges, Consumed:{responseECreate.RequestCharge.ToString(fmt)} RUs, ActivityId:{responseECreate.ActivityId}" +
                             $", {{id: {pointCreateEResult.id}, pk: {pointCreateEResult.pk}, _ts: {pointCreateEResult._ts}, _etag: {pointCreateEResult._etag}}}");
 
-                            Thread.Sleep(100);
+                            Thread.Sleep(request_interval);
                         }
                         Thread.Sleep(request_interval);
 
@@ -402,7 +465,7 @@ namespace azure_cosmosdb_rbac_access
                 }
                 catch (CosmosException ce)
                 {
-                    Console.WriteLine($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, RBAC Item testing ... Error: {ce.Message}");
+                    logger.LogError($"{DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.ffffff")}, RBAC Item testing ... Error: {ce.Message}");
                 }
 
             }
